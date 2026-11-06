@@ -1,16 +1,18 @@
-// Package tree 是 pagefs 的核心：定义固定路径骨架（/tabs.list、/tabs/<id>/…）、
-// 分配词组 id、维护 tab 注册表，并把页面内实体文件路由给数据源。
-// 树只认识 "tab" 这一全局概念；具体页面数据由 Provider 提供。
+// Package tree 是 pagefs 的核心：骨架以节点树存在（node/kind），
+// 解析路径得到（节点，tab 实体），行为按 kind 分派、对接 Provider
+// 的语义方法。树只认识 "tab" 这一全局概念。
 package tree
 
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"io/fs"
+	"log"
 	"os"
 	"path"
+	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -22,12 +24,16 @@ import (
 )
 
 const (
-	srcTimeout  = 10 * time.Second
-	contentName = "content"
+	srcTimeout    = 10 * time.Second
+	metaTimeout   = 2 * time.Second // 实时元数据读取的等待上限，超时回退注册表缓存
+	tabPrefix     = "tab-"
+	cmdFlushDelay = 300 * time.Millisecond
 )
 
 var (
-	errReadOnly = errors.New("pagefs: read-only file")
+	// 携带 os.ErrPermission：go-nfs 由此映射为 NFSStatusAccess（EACCES），
+	// 否则落 IO 类状态，客户端报 "RPC struct is bad"。
+	errReadOnly = fmt.Errorf("pagefs: read-only file: %w", os.ErrPermission)
 )
 
 // tabSlot 是注册表里的一条：pagefs id ↔ 数据源 + 页面。
@@ -37,173 +43,361 @@ type tabSlot struct {
 	tab provider.TabMeta
 }
 
-// Tree 是只读虚拟树。
+// Key 实现 helper.Keyed：注册表以 pagefs id 为键，缓存据此锁内定位。
+func (s tabSlot) Key() string { return s.id }
+
+const (
+	rootName = "pagefs"
+	tabsName = "tabs"
+)
+
+// helpText 是 /help 的内容：树的自我说明，与骨架同步维护。
+const helpText = `pagefs —— 把浏览器映射为文件系统。procfs/ftrace 风格：读 = 查询，写 = 命令。
+
+/tabs/list                     所有 tab 索引：三行一组（id / title / url），组间 ---
+/tabs/open                     写入 URL 开新 tab；响应第三行输出新 tab 路径
+/tabs/tab-<id>/title           标题
+/tabs/tab-<id>/url             URL
+/tabs/tab-<id>/contentType     页面 MIME 类型
+/tabs/tab-<id>/content         页面内容（HTML 取 outerHTML，其余取渲染文本）
+/tabs/tab-<id>/screenshot.png  当前视口截图（PNG）
+/tabs/tab-<id>/navigate        写 URL 原地跳转（触发即回，后台加载）
+/tabs/tab-<id>/reload          重载（触发即回，后台加载）
+/tabs/tab-<id>/back|forward    历史导航（触发即回）
+/tabs/tab-<id>/activate        置前台（抢占桌面焦点）
+/tabs/tab-<id>/close           关闭 tab
+/tabs/tab-<id>/view-source     以源码视图打开本页当前 URL；响应两行：ok|err / 新 tab 路径
+/tabs/tab-<id>/evaljs          写 JS 表达式，等 Promise 落定，结果 JSON 化
+
+用法：
+  cat /tabs/list                                # 枚举所有 tab
+  echo "https://example.com" > /tabs/open       # 开新 tab
+  cat /tabs/open                                # 三行：ok / url / 新 tab 路径
+  echo "document.title" > /tabs/tab-xxx/evaljs  # 求值
+  cat /tabs/tab-xxx/evaljs                      # 三行：ok / 表达式 / "Example Domain"
+  echo clear > /tabs/tab-xxx/evaljs             # 重置节点，还原用法
+
+语义：数据文件读时现取；命令文件写入触发（含空内容，无参动词即靠它），
+读取第一行 ok|err，其后按命令回显请求原文（URL/表达式）并附输出或
+错误信息，末尾带换行；触发词类命令（reload/close/view-source 等）
+不回显请求。写入 clear 或 clr = 重置节点还原用法。命令触发即回
+（ok = 已受理），页面加载在后台进行，就绪与否自行查询（如 evaljs 写
+document.readyState）。
+tab id 固定 tab- 前缀，ls /tabs/tab-* 即纯枚举。
+`
+
+// Tree 是虚拟树：骨架即结构，MultiSliceCache 上的 tab 注册表是唯一
+// 动态命名空间（每数据源一段）。
 type Tree struct {
+	root      *node
+	tabProto  *node
 	ids       *helper.Generator
 	providers []provider.Provider
 	boot      time.Time
 
-	mu   sync.Mutex
-	tabs []tabSlot // 按最近一次枚举的顺序
-}
-
-// Lstat implements [billy.Filesystem].
-func (t *Tree) Lstat(filename string) (os.FileInfo, error) { return t.statAbs(filename) }
-
-// Stat implements [billy.Filesystem].
-func (t *Tree) Stat(filename string) (os.FileInfo, error) { return t.statAbs(filename) }
-
-func (t *Tree) statAbs(name string) (info os.FileInfo, err error) {
-	defer guard(&err)
-	p, err := absPath(name)
-	if err != nil {
-		return nil, err
-	}
-	return t.stat(p)
+	mu        sync.Mutex
+	tabCache  *helper.MultiSliceCache[tabSlot, string] // tab 注册表：段即数据源
+	pending   map[string]*pendingCmd                   // 路径 → 待执行命令
+	responses map[string]string                        // 路径 → 最近一次命令响应
 }
 
 // New 建立树，注册提供 tab 实体的数据源。
 func New(ids *helper.Generator, providers ...provider.Provider) *Tree {
-	return &Tree{ids: ids, providers: providers, boot: time.Now()}
+	proto := node{name: tabPrefix + "<id>", kind: kTabDir, children: map[string]*node{
+		"title":          newNode("title", kMeta, skTitle),
+		"url":            newNode("url", kMeta, skURL),
+		"contentType":    newNode("contentType", kMeta, skContentType),
+		"content":        newNode("content", kContent, ""),
+		"screenshot.png": newNode("screenshot.png", kShot, ""),
+		"navigate":       newCmdNode("navigate", skURL, "写入 URL 原地跳转（触发即回，后台加载）"),
+		"reload":         newCmdNode("reload", skNone, "写入任意内容触发重载（触发即回，后台加载）"),
+		"back":           newCmdNode("back", skNone, "写入任意内容后退历史（触发即回）"),
+		"forward":        newCmdNode("forward", skNone, "写入任意内容前进历史（触发即回）"),
+		"activate":       newCmdNode("activate", skNone, "写入任意内容把窗口置前台（抢占桌面焦点）"),
+		"close":          newCmdNode("close", skNone, "写入任意内容关闭 tab"),
+		"view-source":    newCmdNode("view-source", skNone, "写入任意内容，以源码视图打开本页当前 URL；响应第二行输出新 tab 路径"),
+		"evaljs":         newCmdNode("evaljs", skExpr, "写入 JS 表达式（可返回 Promise），响应第三行输出 JSON 结果"),
+	}}
+	root := node{name: rootName, kind: kDir, children: map[string]*node{
+		tabsName: {name: tabsName, kind: kTabs, children: map[string]*node{
+			"list": newNode("list", kRender, ""),
+			"open": {name: "open", kind: kCmdRoot, arg: skURL,
+				usage: "写入 URL 开新 tab（触发即回），响应第三行输出新 tab 路径"},
+		}},
+		"help": newNode("help", kHelp, ""),
+	}}
+	return &Tree{
+		root:      &root,
+		tabProto:  &proto,
+		ids:       ids,
+		providers: providers,
+		boot:      time.Now(),
+		tabCache:  helper.NewMultiSliceCache[string, tabSlot](len(providers)),
+		pending:   map[string]*pendingCmd{},
+		responses: map[string]string{},
+	}
 }
 
-// ---- 路径骨架 ----
+// ---- 路径解析 ----
 
-// stat 返回节点元数据；实体文件的 size 由数据源保证真实。
-func (t *Tree) stat(p *Path) (os.FileInfo, error) {
-	if p.IsRoot() {
-		return DirNode(rootName, t.boot).Info(), nil
-	}
-	if p.IsTabsList() {
-		return FileNode(tabsListName, int64(len(t.renderTabsList())), t.boot).Info(), nil
-	}
-	if p.IsTabs() {
-		t.reconcile()
-		return DirNode(tabsName, t.boot).Info(), nil
-	}
-	if p.IsTabDir() {
-		if _, ok := t.lookupTab(p.TabID()); !ok {
-			return nil, errNoTab(p.TabID())
+// resolve 沿骨架走路径。kTabs 是动态命名空间：tab- 前缀查聚合
+// （alive 自带未命中复核），取不到即不存在；tab 目录由原型复制携带实体。
+func (t *Tree) resolve(p *Path) (*node, error) {
+	cur := t.root
+	for _, part := range p.Parts {
+		if cur.kind == kTabs && strings.HasPrefix(part, tabPrefix) {
+			s, ok := t.tabAlive(part)
+			if !ok {
+				return nil, errNoTab(part)
+			}
+			cur = t.tabProto.withSlot(&s)
+			continue
 		}
-		return DirNode(p.TabID(), t.boot).Info(), nil
-	}
-	if p.IsTabFile() {
-		slot, ok := t.lookupTab(p.TabID())
+		child, ok := cur.children[part]
 		if !ok {
-			return nil, errNoTab(p.TabID())
-		}
-		// 骨架文件名 → Provider 的语义元数据入口。
-		if p.TabFile() != contentName {
 			return nil, fs.ErrNotExist
 		}
-		info, err := t.providers[slot.pIx].StatContent(t.srcCtx(), slot.tab.ID)
-		if err != nil {
-			return nil, t.tabErr(p.TabID(), err)
+		cur = child
+	}
+	return cur, nil
+}
+
+// ---- 行为分派 ----
+
+// stat 返回节点元数据；实体文件的 size 必须真实（NFS 客户端按它决定
+// READ 是否短路），取不到真实 size 的节点先执行获取。
+func (t *Tree) stat(p *Path) (*statInfo, error) {
+	n, err := t.resolve(p)
+	if err != nil {
+		return nil, err
+	}
+	if p.EndWithSlash && !n.kind.isDir() {
+		return nil, fs.ErrNotExist // 文件不接受尾斜杠
+	}
+	switch n.kind {
+	case kDir, kTabs:
+		return newDirStatInfo(n.name, t.boot), nil
+	case kTabDir:
+		return newDirStatInfo(n.slot.id, t.boot), nil
+	case kRender:
+		return newFileStatInfo(n.name, int64(len(t.renderTabsList())), t.boot), nil
+	case kHelp:
+		return newFileStatInfo(n.name, int64(len(helpText)), t.boot), nil
+	case kMeta:
+		switch n.arg {
+		case skTitle, skURL:
+			v, err := t.metaValue(n, n.arg)
+			if err != nil {
+				return nil, err
+			}
+			return newFileStatInfo(n.name, int64(len(v)), time.Now()), nil
+		case skContentType:
+			ct, err := t.providers[n.slot.pIx].ContentType(t.srcCtx(), n.slot.tab.ID)
+			if err != nil {
+				return nil, t.tabErr(n.slot.id, err)
+			}
+			return newFileStatInfo(n.name, int64(len(ct)), time.Now()), nil
 		}
-		return FileNode(p.TabFile(), info.Size, info.ModTime).Info(), nil
+		return nil, fs.ErrNotExist
+	case kContent:
+		info, err := t.providers[n.slot.pIx].StatContent(t.srcCtx(), n.slot.tab.ID)
+		if err != nil {
+			return nil, t.tabErr(n.slot.id, err)
+		}
+		return newFileStatInfo(n.name, info.Size, info.ModTime), nil
+	case kShot:
+		data, err := t.providers[n.slot.pIx].ReadScreenshot(t.srcCtx(), n.slot.tab.ID)
+		if err != nil {
+			return nil, t.tabErr(n.slot.id, err)
+		}
+		return newFileStatInfo(n.name, int64(len(data)), time.Now()), nil
+	case kCmdRoot, kCmdTab:
+		// GETATTR 即冲刷：客户端以 GETATTR 的 size 界定后续 READ 的长度，
+		// size 必须是执行后响应的真实长度。代价：多块写的下一块 pre-op
+		// Stat 会把首块提前执行——超过单个 WRITE 分块的命令会被分段，
+		// 现实命令远小于分块，按可接受限制处理。
+		t.flushPending(p.String())
+		resp, has := t.response(p.String())
+		if !has {
+			resp = n.usage // 无响应时读到的即用法说明
+		}
+		return newCmdStatInfo(n.name, int64(len(resp)), time.Now()), nil
 	}
 	return nil, fs.ErrNotExist
 }
 
-// list 返回目录子项。
-func (t *Tree) list(p *Path) ([]os.FileInfo, error) {
-	if p.IsRoot() {
-		return []os.FileInfo{
-			FileNode(tabsListName, 0, t.boot).Info(),
-			DirNode(tabsName, t.boot).Info(),
-		}, nil
+// metaValue 实时优先读取元数据：RefreshKey 单点刷新（metaTimeout 上
+// 限），fetchErr 走缓存回退由 helper 记日志；ErrCacheMiss → ENOENT。
+func (t *Tree) metaValue(n *node, arg subkind) (string, error) {
+	m, _, err := t.tabCache.RefreshKey(n.slot.id, metaTimeout, t.tabMetaMerge)
+	if err != nil {
+		return "", errNoTab(n.slot.id)
 	}
-	if p.IsTabs() {
-		t.reconcile()
-		out := []os.FileInfo{}
-		for _, s := range t.tabsSnapshot() {
-			out = append(out, DirNode(s.id, t.boot).Info())
+	switch arg {
+	case skTitle:
+		return m.tab.Title, nil
+	case skURL:
+		return m.tab.URL, nil
+	}
+	return "", ErrUnknownSubKind
+}
+
+// list 返回目录子项；listing 不触发数据源拉取，精确 size 走单文件 stat。
+func (t *Tree) list(p *Path) ([]os.FileInfo, error) {
+	n, err := t.resolve(p)
+	if err != nil {
+		return nil, err
+	}
+	switch n.kind {
+	case kDir, kTabDir:
+		return t.staticListing(n), nil
+	case kTabs:
+		out := t.staticListing(n)
+		for _, s := range t.refreshTabs(srcTimeout) { // ls 触发 list 事件
+			out = append(out, newDirStatInfo(s.id, t.boot))
 		}
 		return out, nil
 	}
-	if p.IsTabDir() {
-		if _, ok := t.lookupTab(p.TabID()); !ok {
-			return nil, errNoTab(p.TabID())
-		}
-		// 目录内容由骨架决定；listing 不触发拉取，精确 size 走单文件 stat。
-		return []os.FileInfo{
-			FileNode(contentName, 0, t.boot).Info(),
-		}, nil
-	}
-	return nil, fs.ErrNotExist
+	return nil, fs.ErrInvalid
 }
 
-// read 打开文件：内容在打开时快照。
-func (t *Tree) read(p *Path) ([]byte, error) {
-	if p.IsTabsList() {
-		return t.renderTabsList(), nil
+// staticListing 按名字序输出静态骨架子项。
+func (t *Tree) staticListing(n *node) []os.FileInfo {
+	names := make([]string, 0, len(n.children))
+	for name := range n.children {
+		names = append(names, name)
 	}
-	if p.IsTabFile() {
-		slot, ok := t.lookupTab(p.TabID())
-		if !ok {
-			return nil, errNoTab(p.TabID())
+	sort.Strings(names)
+	out := make([]os.FileInfo, 0, len(names))
+	for _, name := range names {
+		child := n.children[name]
+		if child.kind.isDir() {
+			out = append(out, newDirStatInfo(name, t.boot))
+		} else if child.kind.isCmd() {
+			out = append(out, newCmdStatInfo(name, 0, t.boot))
+		} else {
+			out = append(out, newFileStatInfo(name, 0, t.boot))
 		}
-		// 骨架文件名 → Provider 的语义读取入口。
-		if p.TabFile() != contentName {
-			return nil, fs.ErrNotExist
+	}
+	return out
+}
+
+// read 读取文件内容（打开时快照）。读打开是命令的冲刷点：
+// cat 的 open 先于 fstat，冲刷后 GETATTR 即拿到响应的真实 size。
+func (t *Tree) read(p *Path) ([]byte, error) {
+	n, err := t.resolve(p)
+	if err != nil {
+		return nil, err
+	}
+	if n.kind.isDir() || p.EndWithSlash {
+		return nil, fs.ErrInvalid
+	}
+	switch n.kind {
+	case kRender:
+		return t.renderTabsList(), nil
+	case kHelp:
+		return []byte(helpText), nil
+	case kMeta:
+		switch n.arg {
+		case skTitle, skURL:
+			v, err := t.metaValue(n, n.arg)
+			if err != nil {
+				return nil, err
+			}
+			return []byte(v), nil
+		case skContentType:
+			ct, err := t.providers[n.slot.pIx].ContentType(t.srcCtx(), n.slot.tab.ID)
+			if err != nil {
+				return nil, t.tabErr(n.slot.id, err)
+			}
+			return []byte(ct), nil
 		}
-		data, err := t.providers[slot.pIx].ReadContent(t.srcCtx(), slot.tab.ID)
+	case kContent:
+		data, err := t.providers[n.slot.pIx].ReadContent(t.srcCtx(), n.slot.tab.ID)
 		if err != nil {
-			return nil, t.tabErr(p.TabID(), err)
+			return nil, t.tabErr(n.slot.id, err)
 		}
 		return data, nil
+	case kShot:
+		data, err := t.providers[n.slot.pIx].ReadScreenshot(t.srcCtx(), n.slot.tab.ID)
+		if err != nil {
+			return nil, t.tabErr(n.slot.id, err)
+		}
+		return data, nil
+	case kCmdRoot, kCmdTab:
+		t.flushPending(p.String())
+		resp, has := t.response(p.String())
+		if !has {
+			resp = n.usage // 无响应时读到的即用法说明
+		}
+		return []byte(resp), nil
 	}
 	return nil, fs.ErrNotExist
 }
 
-// ---- tab 注册表 ----
+// ---- tab 注册表（MultiSliceCache 之上的注册表语义）----
 
-// reconcile 枚举全部数据源并刷新注册表：已有页面保持 id 稳定，
-// 新页面分配 id，消失的回收。仅在 listing / 复核时同步执行。
-// 数据源暂不可达时沿用旧集合。
-func (t *Tree) reconcile() {
-	ctx, cancel := context.WithTimeout(context.Background(), srcTimeout)
-	defer cancel()
-	type liveTab struct {
-		ix  int
-		tab provider.TabMeta
-	}
-	var live []liveTab
-	for ix, prov := range t.providers {
-		tabs, err := prov.TabsList(ctx)
+// enumerateAll 全量 list 事件的 fetch：逐数据源枚举、按段稳定 id；
+// 全部数据源不可达时报错（缓存沿用，瞬时故障不清空注册表）。
+func (t *Tree) enumerateAll(ctx context.Context, old [][]tabSlot) ([][]tabSlot, error) {
+	out := make([][]tabSlot, len(old))
+	reachable := 0
+	for ix := range t.providers {
+		seg, err := t.enumerateSeg(ctx, ix, old[ix])
 		if err != nil {
+			out[ix] = old[ix]
 			continue
 		}
-		for _, tab := range tabs {
-			live = append(live, liveTab{ix, tab})
-		}
+		out[ix] = seg
+		reachable++
 	}
+	if reachable == 0 {
+		return nil, context.DeadlineExceeded
+	}
+	return out, nil
+}
 
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	used := make(map[string]bool, len(live))
-	next := make([]tabSlot, 0, len(live))
-	for _, lt := range live {
+// enumerateSeg 单数据源枚举并按旧段稳定 id：已有页面保持 id，
+// 新页面分配 id，消失的随段回收。
+func (t *Tree) enumerateSeg(ctx context.Context, pIx int, old []tabSlot) ([]tabSlot, error) {
+	tabs, err := t.providers[pIx].TabsList(ctx)
+	if err != nil {
+		return nil, err
+	}
+	used := make(map[string]bool, len(tabs))
+	next := make([]tabSlot, 0, len(tabs))
+	for _, tab := range tabs {
 		id := ""
-		for _, old := range t.tabs {
-			if !used[old.id] && old.pIx == lt.ix && old.tab.ID == lt.tab.ID {
-				id = old.id // 已有页面：id 保持稳定
+		for _, o := range old {
+			if !used[o.id] && o.tab.ID == tab.ID {
+				id = o.id
 				break
 			}
 		}
 		if id == "" {
-			id = t.ids.Next()
+			id = tabPrefix + t.ids.Next()
 		}
 		used[id] = true
-		next = append(next, tabSlot{id: id, pIx: lt.ix, tab: lt.tab})
+		next = append(next, tabSlot{id: id, pIx: pIx, tab: tab})
 	}
-	t.tabs = next
+	return next, nil
+}
+
+// refreshTabs 触发一次全量 list 事件，返回扁平快照。
+func (t *Tree) refreshTabs(timeout time.Duration) []tabSlot {
+	return t.tabCache.Refresh(timeout, t.enumerateAll)
+}
+
+// refreshTabSeg 单源 list 事件：只重枚举第 pIx 段（新 tab 必然落在
+// 已知的那个数据源段，open/view-source 的应答路径用）。
+func (t *Tree) refreshTabSeg(pIx int, timeout time.Duration) {
+	t.tabCache.RefreshSlice(pIx, timeout, func(ctx context.Context, old []tabSlot) ([]tabSlot, error) {
+		return t.enumerateSeg(ctx, pIx, old)
+	})
 }
 
 func (t *Tree) lookupTab(id string) (tabSlot, bool) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	for _, s := range t.tabs {
+	for _, s := range t.tabCache.Snapshot() {
 		if s.id == id {
 			return s, true
 		}
@@ -211,23 +405,64 @@ func (t *Tree) lookupTab(id string) (tabSlot, bool) {
 	return tabSlot{}, false
 }
 
-func (t *Tree) tabsSnapshot() []tabSlot {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return append([]tabSlot(nil), t.tabs...)
+// tabBySource 按数据源稳定键查 slot：open/view-source 执行后回查分配的 id。
+func (t *Tree) tabBySource(key string) (tabSlot, bool) {
+	for _, s := range t.tabCache.Snapshot() {
+		if s.tab.ID == key {
+			return s, true
+		}
+	}
+	return tabSlot{}, false
+}
+
+// tabAlive 取在册实体：命中即回；未命中（新 tab 尚未入册）触发全量
+// list 事件发现——RefreshIndex 只能刷新已存在的槽位，发现不了新实体。
+func (t *Tree) tabAlive(id string) (tabSlot, bool) {
+	if s, ok := t.lookupTab(id); ok {
+		return s, true
+	}
+	t.refreshTabs(srcTimeout)
+	return t.lookupTab(id)
+}
+
+// tabGone 复核实体是否消失：优先 RefreshKey 单点实时探测（fetchErr =
+// nil 即还在且顺手保鲜），探测失败（瞬断或真死）再全量复核一次区分。
+func (t *Tree) tabGone(id string) bool {
+	_, fetchErr, err := t.tabCache.RefreshKey(id, srcTimeout, t.tabMetaMerge)
+	if err != nil {
+		return true // 键已不在缓存
+	}
+	if fetchErr == nil {
+		return false // 实时取到 = 还在
+	}
+	t.refreshTabs(srcTimeout)
+	_, ok := t.lookupTab(id)
+	return !ok
 }
 
 // tabErr 在页面实体操作失败后复核 tab 是否已消失，是则统一为 ENOENT。
 func (t *Tree) tabErr(id string, err error) error {
-	t.reconcile()
-	if _, ok := t.lookupTab(id); !ok {
+	if t.tabGone(id) {
 		return errNoTab(id)
 	}
 	return err
 }
 
+// tabMetaMerge 实时元数据 fetch：取本槽当前页面 Meta 并合并进 tabSlot
+// （id/pIx 保留）。
+func (t *Tree) tabMetaMerge(ctx context.Context, old tabSlot) (tabSlot, error) {
+	meta, err := t.providers[old.pIx].Meta(ctx, old.tab.ID)
+	if err != nil {
+		return tabSlot{}, err
+	}
+	old.tab = meta
+	return old, nil
+}
+
+// errNoTab 用 fs.PathError 承载：go-nfs 以 os.IsNotExist 判定 ENOENT，
+// 而它不解包 fmt.Errorf 的 %w 链，包一层会被映射成 EIO。
 func errNoTab(id string) error {
-	return fmt.Errorf("pagefs: tab %s: %w", id, fs.ErrNotExist)
+	return &fs.PathError{Op: "pagefs tab", Path: id, Err: fs.ErrNotExist}
 }
 
 func (t *Tree) srcCtx() context.Context {
@@ -237,12 +472,19 @@ func (t *Tree) srcCtx() context.Context {
 	return ctx
 }
 
-// ---- tabs.list 渲染（全局格式约定） ----
+// response 返回命令路径上的最近响应；has 形式供墓碑判定。
+func (t *Tree) response(path string) (string, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	s, has := t.responses[path]
+	return s, has
+}
+
+// ---- tabs/list 渲染（全局格式约定） ----
 
 func (t *Tree) renderTabsList() []byte {
-	t.reconcile()
 	var b strings.Builder
-	for i, s := range t.tabsSnapshot() {
+	for i, s := range t.refreshTabs(srcTimeout) { // list 事件：索引读取即刷新
 		if i > 0 {
 			b.WriteString("---\n")
 		}
@@ -256,7 +498,7 @@ func (t *Tree) renderTabsList() []byte {
 	return []byte(b.String())
 }
 
-// sanitize 保证三行一组的结构稳定：字段内容不允许出现换行。
+// sanitize 保证逐行结构稳定：字段内容不允许出现换行。
 func sanitize(s string) string {
 	if strings.ContainsAny(s, "\r\n") {
 		s = strings.ReplaceAll(s, "\r", " ")
@@ -275,31 +517,64 @@ func absPath(name string) (*Path, error) {
 	return NewPath(name)
 }
 
-func (t *Tree) Open(name string) (billy.File, error)   { return t.openAbs(name) }
-func (t *Tree) Create(name string) (billy.File, error) { return nil, errReadOnly }
+func (t *Tree) Open(name string) (billy.File, error)   { return t.openAbs(name, false) }
+func (t *Tree) Create(name string) (billy.File, error) { return t.openAbs(name, true) }
 
 func (t *Tree) OpenFile(name string, flag int, perm os.FileMode) (billy.File, error) {
 	if flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE|os.O_APPEND|os.O_TRUNC) != 0 {
-		return nil, errReadOnly
+		return t.openAbs(name, true)
 	}
-	return t.openAbs(name)
+	return t.openAbs(name, false)
 }
 
-func (t *Tree) openAbs(name string) (f billy.File, err error) {
+func (t *Tree) openAbs(name string, forWrite bool) (f billy.File, err error) {
 	defer guard(&err)
 	p, err := absPath(name)
 	if err != nil {
 		return nil, err
 	}
-	return t.open(p)
+	if forWrite {
+		return t.openWrite(p)
+	}
+	return t.openRead(p)
 }
 
-func (t *Tree) open(p *Path) (billy.File, error) {
+// openRead 打开文件为内存快照句柄。
+func (t *Tree) openRead(p *Path) (billy.File, error) {
 	data, err := t.read(p)
 	if err != nil {
 		return nil, err
 	}
 	return &vfile{name: p.String(), r: bytes.NewReader(data)}, nil
+}
+
+// openWrite 只对命令文件放行，实体数据文件一律只读。
+// 不在此 reset pending：go-nfs 逐 op 开句柄，中途 reset 会丢掉前面的块；
+// 放弃旧命令是 SETATTR 截断（cmdFile.Truncate）的职责。
+func (t *Tree) openWrite(p *Path) (billy.File, error) {
+	n, err := t.resolve(p)
+	if err != nil {
+		return nil, err
+	}
+	if !n.kind.isCmd() {
+		return nil, errReadOnly
+	}
+	return &cmdFile{t: t, path: p.String(), n: n}, nil
+}
+
+// Lstat implements [billy.Filesystem].
+func (t *Tree) Lstat(filename string) (os.FileInfo, error) { return t.statAbs(filename) }
+
+// Stat implements [billy.Filesystem].
+func (t *Tree) Stat(filename string) (os.FileInfo, error) { return t.statAbs(filename) }
+
+func (t *Tree) statAbs(name string) (info os.FileInfo, err error) {
+	defer guard(&err)
+	p, err := absPath(name)
+	if err != nil {
+		return nil, err
+	}
+	return t.stat(p)
 }
 
 func (t *Tree) ReadDir(name string) (out []os.FileInfo, err error) {
@@ -310,6 +585,13 @@ func (t *Tree) ReadDir(name string) (out []os.FileInfo, err error) {
 	}
 	return t.list(p)
 }
+
+// Change 是 SETATTR 元数据操作的 no-op：虚拟树的权限/时间无外部效力，
+// 全部接受以免客户端的重定向流程卡在模式/时间设置上。
+func (t *Tree) Chmod(string, os.FileMode) error            { return nil }
+func (t *Tree) Lchown(string, int, int) error              { return nil }
+func (t *Tree) Chown(string, int, int) error               { return nil }
+func (t *Tree) Chtimes(string, time.Time, time.Time) error { return nil }
 
 func (t *Tree) Join(elem ...string) string { return path.Join(elem...) }
 func (t *Tree) Root() string               { return "/" }
@@ -322,14 +604,16 @@ func (t *Tree) Readlink(string) (string, error)                 { return "", bil
 func (t *Tree) TempFile(dir, prefix string) (billy.File, error) { return nil, errReadOnly }
 func (t *Tree) Chroot(string) (billy.Filesystem, error)         { return nil, billy.ErrNotSupported }
 
-// Capabilities 声明只读，billy.Capabilities 据此拒绝写类操作。
+// Capabilities 声明读写能力：写仅限命令文件，逐路径把关在 openWrite。
 func (t *Tree) Capabilities() billy.Capability {
-	return billy.ReadCapability | billy.SeekCapability
+	return billy.ReadCapability | billy.WriteCapability | billy.ReadAndWriteCapability |
+		billy.SeekCapability | billy.TruncateCapability
 }
 
 // guard 把树内任何 panic 兜底为 IO 错误：协议服务不能因 bug 崩进程。
 func guard(err *error) {
 	if r := recover(); r != nil {
+		log.Printf("[dbg] panic: %v\n%s", r, debug.Stack())
 		*err = fmt.Errorf("pagefs: internal error: %v", r)
 	}
 }

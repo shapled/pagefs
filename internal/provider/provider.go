@@ -22,23 +22,50 @@ type StatInfo struct {
 // Provider 提供 tab 实体：树负责路径骨架与 id，操作时把数据源内的
 // 稳定键（tabID）透传给它。
 //
-// 读取行为按语义命名：ReadDOM / ReadRaw 是内容入口，它们的差异是
-// pagefs 对外承诺的一部分——
-//   - ReadDOM：当前活 DOM（页面此刻的形态，含插件注入的标记）；
-//   - ReadRaw：初始源码（浏览器最初收到的响应体）。
-//
-// 两者对同一页面通常不同（SPA/动态页面差异巨大）。
+// 读取是查询（读时现取），操作是命令：导航类方法等到页面 load 完成
+// 才返回（完成语义），失败经 error 上抛、由树转为可读响应。
 type Provider interface {
 	// TabsList 枚举当前全部页面，实现应当无状态现查。
 	TabsList(ctx context.Context) ([]TabMeta, error)
+
+	// ContentType 返回页面 MIME 类型（document.contentType）。
+	ContentType(ctx context.Context, tabID string) (string, error)
+
+	// Meta 返回页面实时元数据（title / 当前 url），供实时读与注册表保鲜。
+	Meta(ctx context.Context, tabID string) (TabMeta, error)
 
 	// StatContent 返回页面内容文件的信息。size 必须真实——NFS 客户端
 	// 在 READ 前先 GETATTR，按 size 决定是否短路；size=0 会让客户端
 	// 认为文件为空。
 	StatContent(ctx context.Context, tabID string) (StatInfo, error)
 
-	// ReadContent 读取当前页面内容的 DOM 序列化。内容形态由浏览器
-	// 决定：HTML 页面是标记文本，JSON/文本页面被包装在渲染视图里
-	// （按 content type 区分取法是后续改进点）。
+	// ReadContent 读取页面内容：HTML 取 outerHTML，其余类型（text/plain、
+	// JSON、view-source）取渲染文本，绕开浏览器的展示包装。
 	ReadContent(ctx context.Context, tabID string) ([]byte, error)
+
+	// ReadScreenshot 截取当前视口，返回 PNG 字节。
+	ReadScreenshot(ctx context.Context, tabID string) ([]byte, error)
+
+	// OpenTab 打开新页面，返回数据源内新页面的稳定键。
+	OpenTab(ctx context.Context, url string) (string, error)
+
+	// Navigate / Reload / GoBack / GoForward 触发即回：命令受理即返回，
+	// 页面加载在后台进行，就绪与否由调用方自行查询（如 evaljs）。
+	Navigate(ctx context.Context, tabID, url string) error
+	Reload(ctx context.Context, tabID string) error
+	GoBack(ctx context.Context, tabID string) error
+	GoForward(ctx context.Context, tabID string) error
+
+	// Activate 把页面窗口置前台（有桌面副作用）。
+	Activate(ctx context.Context, tabID string) error
+
+	// CloseTab 关闭页面。
+	CloseTab(ctx context.Context, tabID string) error
+
+	// ViewSource 以源码视图（view-source:）打开该页面当前 URL（实时
+	// 取 href，注册表可能陈旧），返回数据源内新页面的稳定键。
+	ViewSource(ctx context.Context, tabID string) (string, error)
+
+	// Eval 在页面内求值 JS 表达式，表达式可返回 Promise（落定后取值）。
+	Eval(ctx context.Context, tabID, expr string) (any, error)
 }
