@@ -6,6 +6,7 @@ package tree
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io/fs"
 	"log"
@@ -24,11 +25,23 @@ import (
 )
 
 const (
-	srcTimeout    = 10 * time.Second
-	metaTimeout   = 2 * time.Second // 实时元数据读取的等待上限，超时回退注册表缓存
-	tabPrefix     = "tab-"
-	cmdFlushDelay = 300 * time.Millisecond
+	tabPrefix = "tab-"
 )
+
+// runtimeVars 是可热更运行时参数（/vars 的背后存储）。
+type runtimeVars struct {
+	srcTimeout    time.Duration // 数据源调用超时
+	metaTimeout   time.Duration // 实时读取与探针超时（须低于客户端 RPC 超时）
+	cmdFlushDelay time.Duration // 命令写入防抖窗口
+}
+
+func defaultVars() runtimeVars {
+	return runtimeVars{
+		srcTimeout:    10 * time.Second,
+		metaTimeout:   500 * time.Millisecond, // RPC 内同步 CDP 读取的上限（macOS 默认 RPC 超时 0.8s）
+		cmdFlushDelay: 300 * time.Millisecond,
+	}
+}
 
 var (
 	// 携带 os.ErrPermission：go-nfs 由此映射为 NFSStatusAccess（EACCES），
@@ -54,28 +67,31 @@ const (
 // helpText 是 /help 的内容：树的自我说明，与骨架同步维护。
 const helpText = `pagefs —— 把浏览器映射为文件系统。procfs/ftrace 风格：读 = 查询，写 = 命令。
 
-/tabs/list                     所有 tab 索引：三行一组（id / title / url），组间 ---
-/tabs/open                     写入 URL 开新 tab；响应第三行输出新 tab 路径
-/tabs/tab-<id>/title           标题
-/tabs/tab-<id>/url             URL
-/tabs/tab-<id>/contentType     页面 MIME 类型
-/tabs/tab-<id>/content         页面内容（HTML 取 outerHTML，其余取渲染文本）
-/tabs/tab-<id>/screenshot.png  当前视口截图（PNG）
-/tabs/tab-<id>/navigate        写 URL 原地跳转（触发即回，后台加载）
-/tabs/tab-<id>/reload          重载（触发即回，后台加载）
-/tabs/tab-<id>/back|forward    历史导航（触发即回）
-/tabs/tab-<id>/activate        置前台（抢占桌面焦点）
-/tabs/tab-<id>/close           关闭 tab
-/tabs/tab-<id>/view-source     以源码视图打开本页当前 URL；响应两行：ok|err / 新 tab 路径
-/tabs/tab-<id>/evaljs          写 JS 表达式，等 Promise 落定，结果 JSON 化
+/list                          所有 tab 索引：三行一组（id / title / url），组间 ---
+/open                          写入 URL 开新 tab；响应第三行输出新 tab 路径
+/status                        只读状态快照（JSON）
+/vars/<param>                  运行时参数：srcTimeout / metaTimeout / cmdFlushDelay（可写热更）
+/tab-<id>/title                标题
+/tab-<id>/url                  URL
+/tab-<id>/contentType          页面 MIME 类型
+/tab-<id>/content              页面内容（HTML 取 outerHTML，其余取渲染文本）
+/tab-<id>/screenshot.png       当前视口截图（PNG）
+/tab-<id>/navigate             写 URL 原地跳转（触发即回，后台加载）
+/tab-<id>/reload               重载（触发即回，后台加载）
+/tab-<id>/back|forward         历史导航（触发即回）
+/tab-<id>/activate             置前台（抢占桌面焦点）
+/tab-<id>/close                关闭 tab（rmdir /tab-<id> 等价）
+/tab-<id>/view-source          以源码视图打开本页当前 URL；响应两行：ok|err / 新 tab 路径
+/tab-<id>/evaljs               写 JS 表达式，等 Promise 落定，结果 JSON 化
 
 用法：
-  cat /tabs/list                                # 枚举所有 tab
-  echo "https://example.com" > /tabs/open       # 开新 tab
-  cat /tabs/open                                # 三行：ok / url / 新 tab 路径
-  echo "document.title" > /tabs/tab-xxx/evaljs  # 求值
-  cat /tabs/tab-xxx/evaljs                      # 三行：ok / 表达式 / "Example Domain"
-  echo clear > /tabs/tab-xxx/evaljs             # 重置节点，还原用法
+  cat /list                                     # 枚举所有 tab
+  echo "https://example.com" > /open            # 开新 tab
+  cat /open                                     # 三行：ok / url / 新 tab 路径
+  echo "document.title" > /tab-xxx/evaljs       # 求值
+  cat /tab-xxx/evaljs                           # 三行：ok / 表达式 / "Example Domain"
+  echo clear > /tab-xxx/evaljs                  # 重置节点，还原用法
+  rmdir /tab-xxx                                # 关闭 tab
 
 语义：数据文件读时现取；命令文件写入触发（含空内容，无参动词即靠它），
 读取第一行 ok|err，其后按命令回显请求原文（URL/表达式）并附输出或
@@ -83,7 +99,7 @@ const helpText = `pagefs —— 把浏览器映射为文件系统。procfs/ftrac
 不回显请求。写入 clear 或 clr = 重置节点还原用法。命令触发即回
 （ok = 已受理），页面加载在后台进行，就绪与否自行查询（如 evaljs 写
 document.readyState）。
-tab id 固定 tab- 前缀，ls /tabs/tab-* 即纯枚举。
+tab id 固定 tab- 前缀，ls / | grep tab- 即纯枚举；/list 与 ls 显示最近缓存快照，list 事件后台刷新。
 `
 
 // Tree 是虚拟树：骨架即结构，MultiSliceCache 上的 tab 注册表是唯一
@@ -97,6 +113,8 @@ type Tree struct {
 
 	mu        sync.Mutex
 	tabCache  *helper.MultiSliceCache[tabSlot, string] // tab 注册表：段即数据源
+	vars      runtimeVars                              // 可热更运行时参数（/vars 背后存储）
+	lastErr   string                                   // 最近一次实体/命令错误（/status 展示）
 	pending   map[string]*pendingCmd                   // 路径 → 待执行命令
 	responses map[string]string                        // 路径 → 最近一次命令响应
 }
@@ -118,13 +136,18 @@ func New(ids *helper.Generator, providers ...provider.Provider) *Tree {
 		"view-source":    newCmdNode("view-source", skNone, "写入任意内容，以源码视图打开本页当前 URL；响应第二行输出新 tab 路径"),
 		"evaljs":         newCmdNode("evaljs", skExpr, "写入 JS 表达式（可返回 Promise），响应第三行输出 JSON 结果"),
 	}}
-	root := node{name: rootName, kind: kDir, children: map[string]*node{
-		tabsName: {name: tabsName, kind: kTabs, children: map[string]*node{
-			"list": newNode("list", kRender, ""),
-			"open": {name: "open", kind: kCmdRoot, arg: skURL,
-				usage: "写入 URL 开新 tab（触发即回），响应第三行输出新 tab 路径"},
+	// 拍平：根即动态命名空间（tab- 前缀实体）+ 控制文件，无 /tabs 层。
+	root := node{name: rootName, kind: kTabs, children: map[string]*node{
+		"list": newNode("list", kRender, ""),
+		"open": {name: "open", kind: kCmdRoot, arg: skURL,
+			usage: "写入 URL 开新 tab（触发即回），响应第三行输出新 tab 路径"},
+		"help":   newNode("help", kHelp, ""),
+		"status": newNode("status", kStatus, ""),
+		"vars": {name: "vars", kind: kDir, children: map[string]*node{
+			"srcTimeout":    newNode("srcTimeout", kVar, skSrcTimeout),
+			"metaTimeout":   newNode("metaTimeout", kVar, skMetaTimeout),
+			"cmdFlushDelay": newNode("cmdFlushDelay", kVar, skCmdFlushDelay),
 		}},
-		"help": newNode("help", kHelp, ""),
 	}}
 	return &Tree{
 		root:      &root,
@@ -133,6 +156,7 @@ func New(ids *helper.Generator, providers ...provider.Provider) *Tree {
 		providers: providers,
 		boot:      time.Now(),
 		tabCache:  helper.NewMultiSliceCache[string, tabSlot](len(providers)),
+		vars:      defaultVars(),
 		pending:   map[string]*pendingCmd{},
 		responses: map[string]string{},
 	}
@@ -183,6 +207,12 @@ func (t *Tree) stat(p *Path) (*statInfo, error) {
 		return newFileStatInfo(n.name, int64(len(t.renderTabsList())), t.boot), nil
 	case kHelp:
 		return newFileStatInfo(n.name, int64(len(helpText)), t.boot), nil
+	case kVar:
+		v := t.getVar(n.arg)
+		return newCmdStatInfo(n.name, int64(len(v)), time.Now()), nil
+	case kStatus:
+		b := t.statusJSON()
+		return newFileStatInfo(n.name, int64(len(b)), t.boot), nil
 	case kMeta:
 		switch n.arg {
 		case skTitle, skURL:
@@ -229,7 +259,7 @@ func (t *Tree) stat(p *Path) (*statInfo, error) {
 // metaValue 实时优先读取元数据：RefreshKey 单点刷新（metaTimeout 上
 // 限），fetchErr 走缓存回退由 helper 记日志；ErrCacheMiss → ENOENT。
 func (t *Tree) metaValue(n *node, arg subkind) (string, error) {
-	m, _, err := t.tabCache.RefreshKey(n.slot.id, metaTimeout, t.tabMetaMerge)
+	m, _, err := t.tabCache.RefreshKey(n.slot.id, t.metaTimeout(), t.tabMetaMerge)
 	if err != nil {
 		return "", errNoTab(n.slot.id)
 	}
@@ -253,8 +283,17 @@ func (t *Tree) list(p *Path) ([]os.FileInfo, error) {
 		return t.staticListing(n), nil
 	case kTabs:
 		out := t.staticListing(n)
-		for _, s := range t.refreshTabs(srcTimeout) { // ls 触发 list 事件
-			out = append(out, newDirStatInfo(s.id, t.boot))
+		// ls 永不阻塞：返回缓存快照，list 事件后台异步刷新（冷启动缓存
+		// 为空时同步刷一次，保证首次枚举可见）
+		if snap := t.tabCache.Snapshot(); len(snap) == 0 {
+			for _, s := range t.refreshTabs(t.metaTimeout()) { // 冷启动同步：短超时，RPC 内
+				out = append(out, newDirStatInfo(s.id, t.boot))
+			}
+		} else {
+			for _, s := range snap {
+				out = append(out, newDirStatInfo(s.id, t.boot))
+			}
+			t.refreshTabsAsync()
 		}
 		return out, nil
 	}
@@ -297,6 +336,10 @@ func (t *Tree) read(p *Path) ([]byte, error) {
 		return t.renderTabsList(), nil
 	case kHelp:
 		return []byte(helpText), nil
+	case kVar:
+		return []byte(t.getVar(n.arg)), nil
+	case kStatus:
+		return t.statusJSON(), nil
 	case kMeta:
 		switch n.arg {
 		case skTitle, skURL:
@@ -385,7 +428,7 @@ func (t *Tree) enumerateSeg(ctx context.Context, pIx int, old []tabSlot) ([]tabS
 
 // refreshTabs 触发一次全量 list 事件，返回扁平快照。
 func (t *Tree) refreshTabs(timeout time.Duration) []tabSlot {
-	return t.tabCache.Refresh(timeout, t.enumerateAll)
+	return t.tabCache.Refresh(t.srcTimeout(), t.enumerateAll)
 }
 
 // refreshTabSeg 单源 list 事件：只重枚举第 pIx 段（新 tab 必然落在
@@ -416,26 +459,28 @@ func (t *Tree) tabBySource(key string) (tabSlot, bool) {
 }
 
 // tabAlive 取在册实体：命中即回；未命中（新 tab 尚未入册）触发全量
-// list 事件发现——RefreshIndex 只能刷新已存在的槽位，发现不了新实体。
+// list 事件发现——RefreshKey 只能刷新已存在的槽位，发现不了新实体。
+// RPC 内同步执行，用短超时（metaTimeout）。
 func (t *Tree) tabAlive(id string) (tabSlot, bool) {
 	if s, ok := t.lookupTab(id); ok {
 		return s, true
 	}
-	t.refreshTabs(srcTimeout)
+	t.refreshTabs(t.metaTimeout())
 	return t.lookupTab(id)
 }
 
 // tabGone 复核实体是否消失：优先 RefreshKey 单点实时探测（fetchErr =
 // nil 即还在且顺手保鲜），探测失败（瞬断或真死）再全量复核一次区分。
+// RPC 内同步执行，用短超时（metaTimeout）。
 func (t *Tree) tabGone(id string) bool {
-	_, fetchErr, err := t.tabCache.RefreshKey(id, srcTimeout, t.tabMetaMerge)
+	_, fetchErr, err := t.tabCache.RefreshKey(id, t.metaTimeout(), t.tabMetaMerge)
 	if err != nil {
 		return true // 键已不在缓存
 	}
 	if fetchErr == nil {
 		return false // 实时取到 = 还在
 	}
-	t.refreshTabs(srcTimeout)
+	t.refreshTabs(t.metaTimeout())
 	_, ok := t.lookupTab(id)
 	return !ok
 }
@@ -445,6 +490,7 @@ func (t *Tree) tabErr(id string, err error) error {
 	if t.tabGone(id) {
 		return errNoTab(id)
 	}
+	t.setLastErr(err)
 	return err
 }
 
@@ -466,10 +512,92 @@ func errNoTab(id string) error {
 }
 
 func (t *Tree) srcCtx() context.Context {
-	ctx, cancel := context.WithTimeout(context.Background(), srcTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), t.srcTimeout())
 	// 超时只约束本次数据源调用；cancel 由 goroutine 兜底释放。
-	go func() { <-time.After(2 * srcTimeout); cancel() }()
+	go func() { <-time.After(2 * t.srcTimeout()); cancel() }()
 	return ctx
+}
+
+// srcTimeout / metaTimeout / flushDelay 读取当前可热更参数。
+func (t *Tree) srcTimeout() time.Duration {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.vars.srcTimeout
+}
+
+func (t *Tree) metaTimeout() time.Duration {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.vars.metaTimeout
+}
+
+func (t *Tree) flushDelay() time.Duration {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.vars.cmdFlushDelay
+}
+
+func (t *Tree) setLastErr(err error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.lastErr = err.Error()
+}
+
+// getVar 返回运行时参数的当前值（/vars/<param> 读侧）。
+func (t *Tree) getVar(name subkind) string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	switch name {
+	case skSrcTimeout:
+		return t.vars.srcTimeout.String()
+	case skMetaTimeout:
+		return t.vars.metaTimeout.String()
+	case skCmdFlushDelay:
+		return t.vars.cmdFlushDelay.String()
+	}
+	return ""
+}
+
+// setVar 校验并应用运行时参数，返回 (载荷, 错误原因)。
+func (t *Tree) setVar(name subkind, val string) (string, string) {
+	d, err := time.ParseDuration(strings.TrimSpace(val))
+	if err != nil || d <= 0 {
+		return "err", "invalid duration: " + val
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	switch name {
+	case skSrcTimeout:
+		t.vars.srcTimeout = d
+	case skMetaTimeout:
+		t.vars.metaTimeout = d
+	case skCmdFlushDelay:
+		t.vars.cmdFlushDelay = d
+	default:
+		return "err", "unknown var"
+	}
+	return "ok", d.String()
+}
+
+// statusJSON 组装 /status 只读快照。
+func (t *Tree) statusJSON() []byte {
+	t.mu.Lock()
+	lastErr := t.lastErr
+	t.mu.Unlock()
+	type status struct {
+		Boot      string `json:"boot"`
+		Providers int    `json:"providers"`
+		Tabs      int    `json:"tabs"`
+		LastError string `json:"lastError,omitempty"`
+	}
+	st := status{
+		Boot:      t.boot.Format(time.RFC3339),
+		Providers: len(t.providers),
+		Tabs:      len(t.tabCache.Snapshot()),
+		LastError: lastErr,
+	}
+	b, _ := json.MarshalIndent(st, "", "  ")
+	return b
 }
 
 // response 返回命令路径上的最近响应；has 形式供墓碑判定。
@@ -484,7 +612,18 @@ func (t *Tree) response(path string) (string, bool) {
 
 func (t *Tree) renderTabsList() []byte {
 	var b strings.Builder
-	for i, s := range t.refreshTabs(srcTimeout) { // list 事件：索引读取即刷新
+	// 与 ls 同策略：即时返回缓存快照，list 事件后台刷新；冷启动同步刷一次。
+	if snap := t.tabCache.Snapshot(); len(snap) > 0 {
+		t.renderFrom(snap, &b)
+		t.refreshTabsAsync()
+		return []byte(b.String())
+	}
+	t.renderFrom(t.refreshTabs(t.metaTimeout()), &b)
+	return []byte(b.String())
+}
+
+func (t *Tree) renderFrom(snap []tabSlot, b *strings.Builder) {
+	for i, s := range snap {
 		if i > 0 {
 			b.WriteString("---\n")
 		}
@@ -495,7 +634,11 @@ func (t *Tree) renderTabsList() []byte {
 		b.WriteString(sanitize(s.tab.URL))
 		b.WriteString("\n")
 	}
-	return []byte(b.String())
+}
+
+// refreshTabsAsync 后台触发 list 事件：枚举永不阻塞读路径。
+func (t *Tree) refreshTabsAsync() {
+	go t.refreshTabs(t.srcTimeout())
 }
 
 // sanitize 保证逐行结构稳定：字段内容不允许出现换行。
@@ -533,6 +676,7 @@ func (t *Tree) openAbs(name string, forWrite bool) (f billy.File, err error) {
 	if err != nil {
 		return nil, err
 	}
+	tr("Open", p.String(), nil)
 	if forWrite {
 		return t.openWrite(p)
 	}
@@ -542,6 +686,7 @@ func (t *Tree) openAbs(name string, forWrite bool) (f billy.File, err error) {
 // openRead 打开文件为内存快照句柄。
 func (t *Tree) openRead(p *Path) (billy.File, error) {
 	data, err := t.read(p)
+	tr("Read", p.String(), err)
 	if err != nil {
 		return nil, err
 	}
@@ -556,7 +701,7 @@ func (t *Tree) openWrite(p *Path) (billy.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !n.kind.isCmd() {
+	if !n.kind.isCmd() && n.kind != kVar {
 		return nil, errReadOnly
 	}
 	return &cmdFile{t: t, path: p.String(), n: n}, nil
@@ -574,7 +719,9 @@ func (t *Tree) statAbs(name string) (info os.FileInfo, err error) {
 	if err != nil {
 		return nil, err
 	}
-	return t.stat(p)
+	info, err = t.stat(p)
+	tr("Stat", p.String(), err)
+	return info, err
 }
 
 func (t *Tree) ReadDir(name string) (out []os.FileInfo, err error) {
@@ -583,7 +730,9 @@ func (t *Tree) ReadDir(name string) (out []os.FileInfo, err error) {
 	if err != nil {
 		return nil, err
 	}
-	return t.list(p)
+	out, err = t.list(p)
+	tr("ReadDir", p.String(), err)
+	return out, err
 }
 
 // Change 是 SETATTR 元数据操作的 no-op：虚拟树的权限/时间无外部效力，
@@ -596,8 +745,38 @@ func (t *Tree) Chtimes(string, time.Time, time.Time) error { return nil }
 func (t *Tree) Join(elem ...string) string { return path.Join(elem...) }
 func (t *Tree) Root() string               { return "/" }
 
-func (t *Tree) Rename(string, string) error                     { return errReadOnly }
-func (t *Tree) Remove(string) error                             { return errReadOnly }
+func (t *Tree) Rename(string, string) error { return errReadOnly }
+
+// tr 输出操作级 trace（PAGEFS_TRACE 开启时），定位协议级问题用。
+var tr = func(op, path string, err error) {
+	if os.Getenv("PAGEFS_TRACE") == "" {
+		return
+	}
+	if err != nil {
+		log.Printf("[trace] %s %s ERR %v", op, path, err)
+	} else {
+		log.Printf("[trace] %s %s", op, path)
+	}
+}
+
+func (t *Tree) Remove(name string) error {
+	defer func() {
+		tr("Remove", name, nil)
+	}()
+	p, err := absPath(name)
+	if err != nil {
+		return err
+	}
+	// 特化：RMDIR(tab-dir) → close（rm -r 的成员 EROFS 报错不影响最终关闭）
+	if len(p.Parts) == 1 && strings.HasPrefix(p.Parts[0], tabPrefix) {
+		slot, ok := t.tabAlive(p.Parts[0])
+		if !ok {
+			return errNoTab(p.Parts[0])
+		}
+		return t.providers[slot.pIx].CloseTab(t.srcCtx(), slot.tab.ID)
+	}
+	return errReadOnly
+}
 func (t *Tree) MkdirAll(string, os.FileMode) error              { return errReadOnly }
 func (t *Tree) Symlink(string, string) error                    { return errReadOnly }
 func (t *Tree) Readlink(string) (string, error)                 { return "", billy.ErrNotSupported }

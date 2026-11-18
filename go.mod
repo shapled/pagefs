@@ -6,6 +6,8 @@ require (
 	github.com/go-git/go-billy/v5 v5.6.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/willscott/go-nfs v0.0.4
+	golang.org/x/sys v0.24.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
@@ -13,5 +15,6 @@ require (
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
 	github.com/rasky/go-xdr v0.0.0-20170124162913-1a41d1a06c93 // indirect
 	github.com/willscott/go-nfs-client v0.0.0-20240104095149-b44639837b00 // indirect
-	golang.org/x/sys v0.24.0 // indirect
 )
+
+replace github.com/willscott/go-nfs => ../third/go-nfs

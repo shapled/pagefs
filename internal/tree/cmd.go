@@ -29,13 +29,14 @@ type pendingCmd struct {
 }
 
 func (t *Tree) ensurePending(path string, n *node) *pendingCmd {
+	delay := t.flushDelay() // 先取参数：flushDelay 要拿 t.mu，锁内调用会自死锁
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if pc, ok := t.pending[path]; ok {
 		return pc
 	}
 	pc := &pendingCmd{t: t, path: path, n: n, finished: make(chan struct{})}
-	pc.timer = time.AfterFunc(cmdFlushDelay, func() { pc.exec() })
+	pc.timer = time.AfterFunc(delay, func() { pc.exec() })
 	t.pending[path] = pc
 	return pc
 }
@@ -44,6 +45,7 @@ func (t *Tree) ensurePending(path string, n *node) *pendingCmd {
 // 顺序块的偏移即追加位置。写入 clear/clr = 重置节点（还原用法说明）；
 // 其余内容（含空白）都是触发。
 func (t *Tree) writePending(path string, n *node, off int64, data []byte) (int, error) {
+	tr("Write", path, nil)
 	switch arg := strings.TrimSpace(string(data)); arg {
 	case "clear", "clr":
 		t.resetNode(path)
@@ -57,7 +59,7 @@ func (t *Tree) writePending(path string, n *node, off int64, data []byte) (int, 
 	}
 	copy(pc.buf[off:end], data)
 	pc.mu.Unlock()
-	pc.timer.Reset(cmdFlushDelay)
+	pc.timer.Reset(pc.t.flushDelay())
 	return len(data), nil
 }
 
@@ -153,20 +155,25 @@ func (t *Tree) execCmd(path string, n *node, arg string) (string, string) {
 		if err != nil {
 			return "err", arg + "\n" + err.Error()
 		}
-		t.refreshTabSeg(0, srcTimeout) // open 结果落在本源段：应答前单源刷新分配 id
+		t.refreshTabSeg(0, t.metaTimeout()) // open 结果落在本源段：应答前单源刷新分配 id
 		if s, ok := t.tabBySource(src); ok {
 			// 第三行给完整路径：agent 拼上挂载点即可直接访问
-			return "ok", arg + "\n/" + tabsName + "/" + s.id
+			return "ok", arg + "\n/" + s.id
 		}
 		return "err", arg + "\nopened but not listed"
 	}
 
+	// kVar：/vars/<param> 写入即校验并热更
+	if n.kind == kVar {
+		return t.setVar(n.arg, arg)
+	}
+
 	// kCmdTab：执行时现查实体——arm 之后 tab 可能已经消失
 	parts := strings.Split(strings.Trim(path, "/"), "/")
-	if len(parts) != 3 {
+	if len(parts) != 2 {
 		return "err", "bad path"
 	}
-	slot, ok := t.tabAlive(parts[1]) // 执行前确认实体在册（未命中复核）
+	slot, ok := t.tabAlive(parts[0]) // 执行前确认实体在册（未命中复核）
 	if !ok {
 		return "err", "tab gone"
 	}
@@ -208,9 +215,9 @@ func (t *Tree) execCmd(path string, n *node, arg string) (string, string) {
 			var nsrc string
 			nsrc, err = prov.ViewSource(t.srcCtx(), src)
 			if err == nil {
-				t.refreshTabSeg(slot.pIx, srcTimeout)
+				t.refreshTabSeg(slot.pIx, t.metaTimeout())
 				if s, ok := t.tabBySource(nsrc); ok {
-					return "ok", "/" + tabsName + "/" + s.id
+					return "ok", "/" + s.id
 				}
 				return "err", "opened but not listed"
 			}

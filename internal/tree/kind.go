@@ -15,6 +15,8 @@ const (
 	kCmdRoot             // 集合级命令
 	kCmdTab              // tab 级命令
 	kHelp                // 树内自述文件（静态文本）
+	kVar                 // 运行时参数文件（可写热更）
+	kStatus              // 只读状态快照
 )
 
 func (k kind) isDir() bool { return k == kDir || k == kTabs || k == kTabDir }
@@ -29,6 +31,10 @@ const (
 	skContentType subkind = "contentType"
 	skExpr        subkind = "expr"
 	skNone        subkind = "none"
+
+	skSrcTimeout    subkind = "srcTimeout"    // /vars：数据源调用超时
+	skMetaTimeout   subkind = "metaTimeout"   // /vars：实时元数据读取超时
+	skCmdFlushDelay subkind = "cmdFlushDelay" // /vars：命令写入防抖窗口
 )
 
 var (
